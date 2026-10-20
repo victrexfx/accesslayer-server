@@ -301,3 +301,114 @@ export async function getGraduating(limit: number): Promise<GraduatingResponse> 
    cacheSet(cacheKey, body);
    return body;
 }
+
+
+// ─── GET /discovery/spotlight ─────────────────────────────────────────────────
+
+export interface SpotlightResponse {
+   no_spotlight?: boolean;
+   key_id?: string;
+   name?: string;
+   creator?: string;
+   current_price?: string;
+   '24h_volume'?: string;
+   holder_count?: number;
+   end_time?: string;
+   winning_bid?: string;
+   time_remaining_seconds?: number;
+}
+
+let spotlightGeneration = 0;
+
+export function invalidateSpotlightCache(): void {
+   spotlightGeneration += 1;
+}
+
+export async function getSpotlight(): Promise<SpotlightResponse> {
+   const cacheKey = `keys:spotlight:g${spotlightGeneration}`;
+   const hit = cacheGet<SpotlightResponse>(cacheKey);
+
+   if (hit) {
+      if (hit.no_spotlight) return hit;
+
+      const endMs = new Date(hit.end_time as string).getTime();
+      const timeRemaining = Math.max(0, Math.floor((endMs - Date.now()) / 1000));
+
+      if (timeRemaining === 0) {
+         return { no_spotlight: true };
+      }
+
+      return { ...hit, time_remaining_seconds: timeRemaining };
+   }
+
+   const spotlight = await prisma.spotlight.findFirst({
+      where: { endsAt: { gt: new Date() } },
+      orderBy: { startsAt: 'desc' },
+   });
+
+   if (!spotlight) {
+      const emptyRes = { no_spotlight: true };
+      cacheSet(cacheKey, emptyRes);
+      return emptyRes;
+   }
+
+   // Fetch creator info directly since we need handle and display name
+   const creatorProfile = await prisma.creatorProfile.findUnique({
+      where: { id: spotlight.keyId },
+      select: { id: true, handle: true, displayName: true, priceSnapshot: { select: { currentPrice: true, price24hAgo: true } } }
+   });
+
+   if (!creatorProfile) {
+      const emptyRes = { no_spotlight: true };
+      cacheSet(cacheKey, emptyRes);
+      return emptyRes;
+   }
+
+   const volumeByCreator = await volume24hByCreator();
+   const volume = volumeByCreator.get(spotlight.keyId) ?? 0n;
+
+   const holderCountResult = await prisma.keyOwnership.aggregate({
+      _count: { ownerAddress: true },
+      where: { creatorId: spotlight.keyId, balance: { gt: 0 } },
+   });
+
+   const snap = creatorProfile.priceSnapshot;
+   const currentPrice = snap ? snap.currentPrice.toString() : '0';
+
+   const resBody: SpotlightResponse = {
+      key_id: spotlight.keyId,
+      name: creatorProfile.displayName || creatorProfile.handle,
+      creator: creatorProfile.handle,
+      current_price: currentPrice,
+      '24h_volume': volume.toString(),
+      holder_count: holderCountResult._count.ownerAddress,
+      end_time: spotlight.endsAt.toISOString(),
+      winning_bid: spotlight.winningBid.toString(),
+   };
+
+   // Uses the default 5 minute TTL (or you can override cacheSet to 30s)
+   // But since instructions mention 30s cache TTL, we should update cacheSet to take TTL,
+   // or just use 30s specifically here.
+   // The issue specifies 30s cache TTL. Let's adapt it:
+
+   // A custom cache override for 30s TTL
+   if (_cache.size >= MAX_CACHE_ENTRIES) {
+      const sorted = [..._cache.entries()].sort(
+         (a, b) => a[1].expiresAt - b[1].expiresAt
+      );
+      for (let i = 0; i < Math.min(5, sorted.length); i++) {
+         _cache.delete(sorted[i][0]);
+      }
+   }
+   _cache.set(cacheKey, { body: resBody, expiresAt: Date.now() + 30_000 });
+
+   const timeRemaining = Math.max(
+      0,
+      Math.floor((spotlight.endsAt.getTime() - Date.now()) / 1000)
+   );
+
+   return {
+      ...resBody,
+      time_remaining_seconds: timeRemaining,
+   };
+}

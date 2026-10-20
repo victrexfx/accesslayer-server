@@ -3,9 +3,8 @@ import {
    getLeaderboard,
    searchAll,
    invalidateKeysCache,
-   getSpotlight,
-   invalidateSpotlightCache,
 } from './keys-discovery.service';
+import { getSpotlight, invalidateSpotlightCache } from './discovery.service';
 import { prisma } from '../../utils/prisma.utils';
 
 // Issue #901 / #896 / #895 — the discovery, leaderboard and search services.
@@ -23,12 +22,7 @@ jest.mock('../../utils/prisma.utils', () => ({
 }));
 
 jest.mock('../../utils/logger.utils', () => ({
-   logger: {
-      warn: jest.fn(),
-      error: jest.fn(),
-      info: jest.fn(),
-      debug: jest.fn(),
-   },
+   logger: { warn: jest.fn(), error: jest.fn(), info: jest.fn(), debug: jest.fn() },
 }));
 
 const mockedPrisma = prisma as unknown as {
@@ -74,19 +68,17 @@ describe('getDiscovery (#901)', () => {
          async (args: any) => {
             if (args.orderBy) {
                // new listings query
-               return ['g', 'h'].map(id => CREATOR_BARE(id, `new-${id}`));
+               return ['g', 'h'].map((id) => CREATOR_BARE(id, `new-${id}`));
             }
             const ids: string[] = args.where.id.in;
-            return ids.map(id => CREATOR(id, `key-${id}`, '500', '400'));
+            return ids.map((id) => CREATOR(id, `key-${id}`, '500', '400'));
          }
       );
 
       const body = await getDiscovery();
       expect(body.trending).toHaveLength(5);
       expect(body.trending[0].volume_24h).toBe('1000');
-      expect(
-         (body.trending[0] as unknown as { rank?: number }).rank ?? undefined
-      ).toBeUndefined();
+      expect((body.trending[0] as unknown as { rank?: number }).rank ?? undefined).toBeUndefined();
       expect(body.new_listings).toHaveLength(2);
       // Snapshot-derived price and change present on every entry.
       expect(body.trending[0].price).toBe('500');
@@ -132,27 +124,17 @@ describe('getLeaderboard (#896)', () => {
       mockedPrisma.trade.findMany.mockImplementation(async (args: any) => {
          void args;
          return [
-            ...Array.from({ length: 5 }, () => ({
-               creatorId: 'low',
-               price: '1',
-            })),
-            ...Array.from({ length: 999 }, () => ({
-               creatorId: 'high',
-               price: '1',
-            })),
-            ...Array.from({ length: 50 }, () => ({
-               creatorId: 'mid',
-               price: '1',
-            })),
+            ...Array.from({ length: 5 }, () => ({ creatorId: 'low', price: '1' })),
+            ...Array.from({ length: 999 }, () => ({ creatorId: 'high', price: '1' })),
+            ...Array.from({ length: 50 }, () => ({ creatorId: 'mid', price: '1' })),
          ];
       });
-      mockedPrisma.creatorProfile.findMany.mockImplementation(
-         async (args: any) =>
-            (args.where.id.in as string[]).map(id => CREATOR(id, id, '10', '5'))
+      mockedPrisma.creatorProfile.findMany.mockImplementation(async (args: any) =>
+         (args.where.id.in as string[]).map((id) => CREATOR(id, id, '10', '5'))
       );
 
       const body = await getLeaderboard('24h', 10);
-      expect(body.items.map(i => i.key_id)).toEqual(['high', 'mid', 'low']);
+      expect(body.items.map((i) => i.key_id)).toEqual(['high', 'mid', 'low']);
       expect(body.items[0].rank).toBe(1);
       expect(body.items[2].volume_24h).toBe('5');
    });
@@ -172,7 +154,17 @@ describe('getLeaderboard (#896)', () => {
    });
 });
 
+
 describe('getSpotlight (#1151)', () => {
+   beforeEach(() => {
+      jest.useFakeTimers();
+      jest.setSystemTime(new Date('2024-01-01T12:00:00.000Z'));
+   });
+
+   afterEach(() => {
+      jest.useRealTimers();
+   });
+
    it('returns no_spotlight: true when no active spotlight exists', async () => {
       mockedPrisma.spotlight.findFirst.mockResolvedValue(null);
 
@@ -186,13 +178,13 @@ describe('getSpotlight (#1151)', () => {
    });
 
    it('returns correctly formatted active spotlight details', async () => {
-      const endsAt = new Date(Date.now() + 60_000); // 1 minute in the future
+      const endsAt = new Date('2024-01-01T12:01:00.000Z'); // 60 seconds in the future
       mockedPrisma.spotlight.findFirst.mockResolvedValue({
          id: 'spot-1',
          keyId: 'spotlighted-key',
          winnerWallet: 'winner-wallet',
          winningBid: 123.456,
-         startsAt: new Date(),
+         startsAt: new Date('2024-01-01T11:59:00.000Z'),
          endsAt,
       });
 
@@ -202,6 +194,7 @@ describe('getSpotlight (#1151)', () => {
 
       mockedPrisma.creatorProfile.findUnique.mockResolvedValue({
          handle: 'handle',
+         priceSnapshot: { currentPrice: '789' }
       });
 
       mockedPrisma.keyOwnership.aggregate.mockResolvedValue({
@@ -223,11 +216,70 @@ describe('getSpotlight (#1151)', () => {
       expect(body.holder_count).toBe(42);
       expect(body.end_time).toBe(endsAt.toISOString());
       expect(body.winning_bid).toBe('123.456');
-      expect(body.time_remaining_seconds).toBeGreaterThan(0);
-      expect(body.time_remaining_seconds).toBeLessThanOrEqual(60);
+      expect(body.time_remaining_seconds).toBe(60);
    });
 
-   it('invalidates cache correctly', async () => {
+   it('decreases time_remaining_seconds between calls from the cache', async () => {
+      const endsAt = new Date('2024-01-01T12:01:00.000Z'); // 60s
+      mockedPrisma.spotlight.findFirst.mockResolvedValue({
+         id: 'spot-1', keyId: 'spot', winningBid: 100, startsAt: new Date(), endsAt
+      });
+      mockedPrisma.creatorProfile.findMany.mockResolvedValue([CREATOR('spot', 'h', '1', '1')]);
+      mockedPrisma.creatorProfile.findUnique.mockResolvedValue({ handle: 'h' });
+      mockedPrisma.keyOwnership.aggregate.mockResolvedValue({ _count: { ownerAddress: 1 } });
+      mockedPrisma.trade.findMany.mockResolvedValue([]);
+
+      const b1 = await getSpotlight();
+      expect(b1.time_remaining_seconds).toBe(60);
+
+      jest.setSystemTime(new Date('2024-01-01T12:00:10.000Z')); // +10s
+
+      const b2 = await getSpotlight();
+      expect(b2.time_remaining_seconds).toBe(50);
+      expect(mockedPrisma.spotlight.findFirst).toHaveBeenCalledTimes(1); // Cached
+   });
+
+   it('expires cache after 30 seconds and queries database again', async () => {
+      const endsAt = new Date('2024-01-01T12:01:00.000Z'); // 60s
+      mockedPrisma.spotlight.findFirst.mockResolvedValue({
+         id: 'spot-1', keyId: 'spot', winningBid: 100, startsAt: new Date(), endsAt
+      });
+      mockedPrisma.creatorProfile.findMany.mockResolvedValue([CREATOR('spot', 'h', '1', '1')]);
+      mockedPrisma.creatorProfile.findUnique.mockResolvedValue({ handle: 'h' });
+      mockedPrisma.keyOwnership.aggregate.mockResolvedValue({ _count: { ownerAddress: 1 } });
+      mockedPrisma.trade.findMany.mockResolvedValue([]);
+
+      await getSpotlight();
+      expect(mockedPrisma.spotlight.findFirst).toHaveBeenCalledTimes(1);
+
+      jest.setSystemTime(new Date('2024-01-01T12:00:31.000Z')); // +31s
+      await getSpotlight();
+      expect(mockedPrisma.spotlight.findFirst).toHaveBeenCalledTimes(2); // Cache expired
+   });
+
+   it('returns no_spotlight: true if a cached spotlight expires', async () => {
+      const endsAt = new Date('2024-01-01T12:00:15.000Z'); // 15s in the future
+      mockedPrisma.spotlight.findFirst.mockResolvedValue({
+         id: 'spot-1', keyId: 'spot', winningBid: 100, startsAt: new Date(), endsAt
+      });
+      mockedPrisma.creatorProfile.findMany.mockResolvedValue([CREATOR('spot', 'h', '1', '1')]);
+      mockedPrisma.creatorProfile.findUnique.mockResolvedValue({ handle: 'h' });
+      mockedPrisma.keyOwnership.aggregate.mockResolvedValue({ _count: { ownerAddress: 1 } });
+      mockedPrisma.trade.findMany.mockResolvedValue([]);
+
+      const b1 = await getSpotlight();
+      expect(b1.no_spotlight).toBeUndefined();
+      expect(mockedPrisma.spotlight.findFirst).toHaveBeenCalledTimes(1);
+
+      // Advance time beyond the spotlight's end time, but before the 30s cache expires
+      jest.setSystemTime(new Date('2024-01-01T12:00:20.000Z')); // +20s
+
+      const b2 = await getSpotlight();
+      expect(b2).toEqual({ no_spotlight: true });
+      expect(mockedPrisma.spotlight.findFirst).toHaveBeenCalledTimes(1); // Served from cache
+   });
+
+   it('invalidates cache correctly via invalidateSpotlightCache', async () => {
       mockedPrisma.spotlight.findFirst.mockResolvedValue(null);
 
       await getSpotlight();
