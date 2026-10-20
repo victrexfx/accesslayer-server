@@ -232,11 +232,23 @@ describe('getSpotlight (#1151)', () => {
       const b1 = await getSpotlight();
       expect(b1.time_remaining_seconds).toBe(60);
 
-      jest.setSystemTime(new Date('2024-01-01T12:00:10.000Z')); // +10s
+      jest.setSystemTime(new Date('2024-01-01T12:00:10.000Z'));
 
       const b2 = await getSpotlight();
       expect(b2.time_remaining_seconds).toBe(50);
       expect(mockedPrisma.spotlight.findFirst).toHaveBeenCalledTimes(1); // Cached
+   });
+
+
+   it('expires no_spotlight cache after 30 seconds and queries database again', async () => {
+      mockedPrisma.spotlight.findFirst.mockResolvedValue(null);
+
+      await getSpotlight();
+      expect(mockedPrisma.spotlight.findFirst).toHaveBeenCalledTimes(1);
+
+      jest.setSystemTime(new Date('2024-01-01T12:00:31.001Z'));
+      await getSpotlight();
+      expect(mockedPrisma.spotlight.findFirst).toHaveBeenCalledTimes(2); // Cache expired
    });
 
    it('expires cache after 30 seconds and queries database again', async () => {
@@ -252,7 +264,7 @@ describe('getSpotlight (#1151)', () => {
       await getSpotlight();
       expect(mockedPrisma.spotlight.findFirst).toHaveBeenCalledTimes(1);
 
-      jest.setSystemTime(new Date('2024-01-01T12:00:31.000Z')); // +31s
+      jest.setSystemTime(new Date('2024-01-01T12:00:31.001Z'));
       await getSpotlight();
       expect(mockedPrisma.spotlight.findFirst).toHaveBeenCalledTimes(2); // Cache expired
    });
@@ -272,7 +284,7 @@ describe('getSpotlight (#1151)', () => {
       expect(mockedPrisma.spotlight.findFirst).toHaveBeenCalledTimes(1);
 
       // Advance time beyond the spotlight's end time, but before the 30s cache expires
-      jest.setSystemTime(new Date('2024-01-01T12:00:20.000Z')); // +20s
+      jest.setSystemTime(new Date('2024-01-01T12:00:20.000Z'));
 
       const b2 = await getSpotlight();
       expect(b2).toEqual({ no_spotlight: true });

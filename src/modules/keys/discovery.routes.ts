@@ -11,7 +11,6 @@ import {
    zodIssuesToDetails,
 } from '../../utils/api-response.utils';
 import { getTrending, getNewKeys, getGraduating, getSpotlight } from './discovery.service';
-import { getSpotlight } from './keys-discovery.service';
 
 const router = Router();
 

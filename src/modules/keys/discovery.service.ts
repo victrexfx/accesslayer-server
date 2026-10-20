@@ -36,7 +36,7 @@ function cacheGet<T>(key: string): T | undefined {
    return entry.body;
 }
 
-function cacheSet<T>(key: string, body: T): void {
+function cacheSet<T>(key: string, body: T, ttlMs: number = DISCOVERY_TTL_MS): void {
    if (_cache.size >= MAX_CACHE_ENTRIES) {
       const sorted = [..._cache.entries()].sort(
          (a, b) => a[1].expiresAt - b[1].expiresAt
@@ -45,7 +45,7 @@ function cacheSet<T>(key: string, body: T): void {
          _cache.delete(sorted[i][0]);
       }
    }
-   _cache.set(key, { body, expiresAt: Date.now() + DISCOVERY_TTL_MS });
+   _cache.set(key, { body, expiresAt: Date.now() + ttlMs });
 }
 
 // ─── Shared types ──────────────────────────────────────────────────────────────
@@ -348,7 +348,7 @@ export async function getSpotlight(): Promise<SpotlightResponse> {
 
    if (!spotlight) {
       const emptyRes = { no_spotlight: true };
-      cacheSet(cacheKey, emptyRes);
+      cacheSet(cacheKey, emptyRes, 30_000);
       return emptyRes;
    }
 
@@ -360,7 +360,7 @@ export async function getSpotlight(): Promise<SpotlightResponse> {
 
    if (!creatorProfile) {
       const emptyRes = { no_spotlight: true };
-      cacheSet(cacheKey, emptyRes);
+      cacheSet(cacheKey, emptyRes, 30_000);
       return emptyRes;
    }
 
@@ -386,21 +386,7 @@ export async function getSpotlight(): Promise<SpotlightResponse> {
       winning_bid: spotlight.winningBid.toString(),
    };
 
-   // Uses the default 5 minute TTL (or you can override cacheSet to 30s)
-   // But since instructions mention 30s cache TTL, we should update cacheSet to take TTL,
-   // or just use 30s specifically here.
-   // The issue specifies 30s cache TTL. Let's adapt it:
-
-   // A custom cache override for 30s TTL
-   if (_cache.size >= MAX_CACHE_ENTRIES) {
-      const sorted = [..._cache.entries()].sort(
-         (a, b) => a[1].expiresAt - b[1].expiresAt
-      );
-      for (let i = 0; i < Math.min(5, sorted.length); i++) {
-         _cache.delete(sorted[i][0]);
-      }
-   }
-   _cache.set(cacheKey, { body: resBody, expiresAt: Date.now() + 30_000 });
+   cacheSet(cacheKey, resBody, 30_000);
 
    const timeRemaining = Math.max(
       0,
