@@ -3,6 +3,8 @@ import {
    getLeaderboard,
    searchAll,
    invalidateKeysCache,
+   getSpotlight,
+   invalidateSpotlightCache,
 } from './keys-discovery.service';
 import { prisma } from '../../utils/prisma.utils';
 
@@ -13,18 +15,27 @@ import { prisma } from '../../utils/prisma.utils';
 jest.mock('../../utils/prisma.utils', () => ({
    prisma: {
       trade: { findMany: jest.fn() },
-      creatorProfile: { findMany: jest.fn() },
+      creatorProfile: { findMany: jest.fn(), findUnique: jest.fn() },
+      spotlight: { findFirst: jest.fn() },
+      keyOwnership: { aggregate: jest.fn() },
       $queryRawUnsafe: jest.fn(),
    },
 }));
 
 jest.mock('../../utils/logger.utils', () => ({
-   logger: { warn: jest.fn(), error: jest.fn(), info: jest.fn(), debug: jest.fn() },
+   logger: {
+      warn: jest.fn(),
+      error: jest.fn(),
+      info: jest.fn(),
+      debug: jest.fn(),
+   },
 }));
 
 const mockedPrisma = prisma as unknown as {
    trade: { findMany: jest.Mock };
-   creatorProfile: { findMany: jest.Mock };
+   creatorProfile: { findMany: jest.Mock; findUnique: jest.Mock };
+   spotlight: { findFirst: jest.Mock };
+   keyOwnership: { aggregate: jest.Mock };
    $queryRawUnsafe: jest.Mock;
 };
 
@@ -45,6 +56,7 @@ const CREATOR_BARE = (id: string, handle: string) => ({
 beforeEach(() => {
    jest.clearAllMocks();
    invalidateKeysCache();
+   invalidateSpotlightCache();
 });
 
 describe('getDiscovery (#901)', () => {
@@ -62,17 +74,19 @@ describe('getDiscovery (#901)', () => {
          async (args: any) => {
             if (args.orderBy) {
                // new listings query
-               return ['g', 'h'].map((id) => CREATOR_BARE(id, `new-${id}`));
+               return ['g', 'h'].map(id => CREATOR_BARE(id, `new-${id}`));
             }
             const ids: string[] = args.where.id.in;
-            return ids.map((id) => CREATOR(id, `key-${id}`, '500', '400'));
+            return ids.map(id => CREATOR(id, `key-${id}`, '500', '400'));
          }
       );
 
       const body = await getDiscovery();
       expect(body.trending).toHaveLength(5);
       expect(body.trending[0].volume_24h).toBe('1000');
-      expect((body.trending[0] as unknown as { rank?: number }).rank ?? undefined).toBeUndefined();
+      expect(
+         (body.trending[0] as unknown as { rank?: number }).rank ?? undefined
+      ).toBeUndefined();
       expect(body.new_listings).toHaveLength(2);
       // Snapshot-derived price and change present on every entry.
       expect(body.trending[0].price).toBe('500');
@@ -118,17 +132,27 @@ describe('getLeaderboard (#896)', () => {
       mockedPrisma.trade.findMany.mockImplementation(async (args: any) => {
          void args;
          return [
-            ...Array.from({ length: 5 }, () => ({ creatorId: 'low', price: '1' })),
-            ...Array.from({ length: 999 }, () => ({ creatorId: 'high', price: '1' })),
-            ...Array.from({ length: 50 }, () => ({ creatorId: 'mid', price: '1' })),
+            ...Array.from({ length: 5 }, () => ({
+               creatorId: 'low',
+               price: '1',
+            })),
+            ...Array.from({ length: 999 }, () => ({
+               creatorId: 'high',
+               price: '1',
+            })),
+            ...Array.from({ length: 50 }, () => ({
+               creatorId: 'mid',
+               price: '1',
+            })),
          ];
       });
-      mockedPrisma.creatorProfile.findMany.mockImplementation(async (args: any) =>
-         (args.where.id.in as string[]).map((id) => CREATOR(id, id, '10', '5'))
+      mockedPrisma.creatorProfile.findMany.mockImplementation(
+         async (args: any) =>
+            (args.where.id.in as string[]).map(id => CREATOR(id, id, '10', '5'))
       );
 
       const body = await getLeaderboard('24h', 10);
-      expect(body.items.map((i) => i.key_id)).toEqual(['high', 'mid', 'low']);
+      expect(body.items.map(i => i.key_id)).toEqual(['high', 'mid', 'low']);
       expect(body.items[0].rank).toBe(1);
       expect(body.items[2].volume_24h).toBe('5');
    });
@@ -145,6 +169,77 @@ describe('getLeaderboard (#896)', () => {
             })
          );
       }
+   });
+});
+
+describe('getSpotlight (#1151)', () => {
+   it('returns no_spotlight: true when no active spotlight exists', async () => {
+      mockedPrisma.spotlight.findFirst.mockResolvedValue(null);
+
+      const body = await getSpotlight();
+      expect(body).toEqual({ no_spotlight: true });
+      expect(mockedPrisma.spotlight.findFirst).toHaveBeenCalledTimes(1);
+
+      // Verify it was cached
+      await getSpotlight();
+      expect(mockedPrisma.spotlight.findFirst).toHaveBeenCalledTimes(1);
+   });
+
+   it('returns correctly formatted active spotlight details', async () => {
+      const endsAt = new Date(Date.now() + 60_000); // 1 minute in the future
+      mockedPrisma.spotlight.findFirst.mockResolvedValue({
+         id: 'spot-1',
+         keyId: 'spotlighted-key',
+         winnerWallet: 'winner-wallet',
+         winningBid: 123.456,
+         startsAt: new Date(),
+         endsAt,
+      });
+
+      mockedPrisma.creatorProfile.findMany.mockResolvedValue([
+         CREATOR('spotlighted-key', 'handle', '789', '600'),
+      ]);
+
+      mockedPrisma.creatorProfile.findUnique.mockResolvedValue({
+         handle: 'handle',
+      });
+
+      mockedPrisma.keyOwnership.aggregate.mockResolvedValue({
+         _count: { ownerAddress: 42 },
+      });
+
+      mockedPrisma.trade.findMany.mockResolvedValue([
+         { creatorId: 'spotlighted-key', price: '100' },
+         { creatorId: 'spotlighted-key', price: '200' },
+      ]);
+
+      const body = await getSpotlight();
+
+      expect(body.no_spotlight).toBeUndefined();
+      expect(body.key_id).toBe('spotlighted-key');
+      expect(body.creator).toBe('handle');
+      expect(body.current_price).toBe('789');
+      expect(body['24h_volume']).toBe('300'); // 100 + 200
+      expect(body.holder_count).toBe(42);
+      expect(body.end_time).toBe(endsAt.toISOString());
+      expect(body.winning_bid).toBe('123.456');
+      expect(body.time_remaining_seconds).toBeGreaterThan(0);
+      expect(body.time_remaining_seconds).toBeLessThanOrEqual(60);
+   });
+
+   it('invalidates cache correctly', async () => {
+      mockedPrisma.spotlight.findFirst.mockResolvedValue(null);
+
+      await getSpotlight();
+      expect(mockedPrisma.spotlight.findFirst).toHaveBeenCalledTimes(1);
+
+      await getSpotlight();
+      expect(mockedPrisma.spotlight.findFirst).toHaveBeenCalledTimes(1);
+
+      invalidateSpotlightCache();
+
+      await getSpotlight();
+      expect(mockedPrisma.spotlight.findFirst).toHaveBeenCalledTimes(2);
    });
 });
 

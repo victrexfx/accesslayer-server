@@ -158,6 +158,95 @@ const DISCOVERY_TTL_MS = 60_000; // 60s TTL per the issue
 const TRENDING_LIMIT = 5;
 const NEW_LISTINGS_LIMIT = 10;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// #1151 — GET /discovery/spotlight
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface SpotlightResponse {
+   no_spotlight?: boolean;
+   key_id?: string;
+   name?: string;
+   creator?: string;
+   current_price?: string;
+   '24h_volume'?: string;
+   holder_count?: number;
+   end_time?: string;
+   winning_bid?: string;
+   time_remaining_seconds?: number;
+}
+
+let spotlightGeneration = 0;
+
+export function invalidateSpotlightCache(): void {
+   spotlightGeneration += 1;
+}
+
+export async function getSpotlight(): Promise<SpotlightResponse> {
+   const cacheKey = `keys:spotlight:g${spotlightGeneration}`;
+   const hit = cacheGet(cacheKey);
+
+   if (hit) {
+      const cached = hit as SpotlightResponse;
+      if (cached.no_spotlight) return cached;
+      const endMs = new Date(cached.end_time as string).getTime();
+      const timeRemaining = Math.max(
+         0,
+         Math.floor((endMs - Date.now()) / 1000)
+      );
+      return { ...cached, time_remaining_seconds: timeRemaining };
+   }
+
+   const spotlight = await prisma.spotlight.findFirst({
+      where: { endsAt: { gt: new Date() } },
+      orderBy: { startsAt: 'desc' },
+   });
+
+   if (!spotlight) {
+      const emptyRes = { no_spotlight: true };
+      cacheSet(cacheKey, emptyRes, 30_000);
+      return emptyRes;
+   }
+
+   const entries = await buildMarketEntries([spotlight.keyId]);
+   const entry = entries.get(spotlight.keyId);
+
+   const volumeByCreator = await aggregateVolumeByCreator('24h');
+   const volume = volumeByCreator.get(spotlight.keyId) ?? 0n;
+
+   const holderCountResult = await prisma.keyOwnership.aggregate({
+      _count: { ownerAddress: true },
+      where: { creatorId: spotlight.keyId, balance: { gt: 0 } },
+   });
+
+   const creatorProfile = await prisma.creatorProfile.findUnique({
+      where: { id: spotlight.keyId },
+      select: { handle: true },
+   });
+
+   const resBody: SpotlightResponse = {
+      key_id: spotlight.keyId,
+      name: entry?.name ?? '',
+      creator: creatorProfile?.handle ?? '',
+      current_price: entry?.price ?? '0',
+      '24h_volume': volume.toString(),
+      holder_count: holderCountResult._count.ownerAddress,
+      end_time: spotlight.endsAt.toISOString(),
+      winning_bid: spotlight.winningBid.toString(),
+   };
+
+   cacheSet(cacheKey, resBody, 30_000);
+
+   const timeRemaining = Math.max(
+      0,
+      Math.floor((spotlight.endsAt.getTime() - Date.now()) / 1000)
+   );
+
+   return {
+      ...resBody,
+      time_remaining_seconds: timeRemaining,
+   };
+}
+
 export async function getDiscovery(): Promise<DiscoveryResponse> {
    const cacheKey = `keys:discovery:g${cacheGeneration}`;
    const hit = cacheGet(cacheKey);
@@ -179,7 +268,7 @@ export async function getDiscovery(): Promise<DiscoveryResponse> {
       .slice(0, TRENDING_LIMIT)
       .map(([id]) => id);
 
-   const allIds = [...new Set([...trendingIds, ...newCreators.map((c) => c.id)])];
+   const allIds = [...new Set([...trendingIds, ...newCreators.map(c => c.id)])];
    const entries = await buildMarketEntries(allIds);
 
    for (const [creatorId, volume] of volumeByCreator) {
@@ -188,12 +277,12 @@ export async function getDiscovery(): Promise<DiscoveryResponse> {
    }
 
    const trending = trendingIds
-      .map((id) => entries.get(id))
+      .map(id => entries.get(id))
       .filter((e): e is KeyMarketEntry => Boolean(e));
 
    // New listings ordered by creation date descending — the findMany order.
    const newListings = newCreators
-      .map((c) => entries.get(c.id))
+      .map(c => entries.get(c.id))
       .filter((e): e is KeyMarketEntry => Boolean(e));
 
    const body: DiscoveryResponse = {
@@ -345,21 +434,25 @@ export async function searchAll(
            })
          : Promise.resolve([]),
       want('proposals')
-         ? prisma.$queryRawUnsafe<
-              Array<{ id: string; title: string; description?: string | null }>
-           >(
-              `SELECT id, title, description FROM governance_proposals
+         ? prisma
+              .$queryRawUnsafe<
+                 Array<{
+                    id: string;
+                    title: string;
+                    description?: string | null;
+                 }>
+              >(
+                 `SELECT id, title, description FROM governance_proposals
                WHERE title ILIKE ${`'%${query.replace(/'/g, "''")}%'`}
                ORDER BY created_at DESC LIMIT ${SEARCH_PER_TYPE_LIMIT}`
-           )
+              )
               .catch((err: unknown) => {
                  // The governance table is provisioned by the governance
                  // service; when absent, search still returns the other
                  // sections rather than failing the whole query.
                  logger.warn(
                     {
-                       error:
-                          err instanceof Error ? err.message : String(err),
+                       error: err instanceof Error ? err.message : String(err),
                     },
                     'governance_proposals table unavailable for search'
                  );
@@ -368,23 +461,25 @@ export async function searchAll(
          : Promise.resolve([]),
    ]);
 
-   const keyHits: SearchHit[] = keys.map((k) => ({
+   const keyHits: SearchHit[] = keys.map(k => ({
       type: 'keys' as const,
       id: k.id,
       name: k.displayName || k.handle,
       description: k.bio ?? null,
    }));
-   const creatorHits: SearchHit[] = creators.map((c) => ({
+   const creatorHits: SearchHit[] = creators.map(c => ({
       type: 'creators' as const,
       id: c.id,
       name: c.displayName || c.handle,
       description: c.bio ?? null,
    }));
-   const proposalHits: SearchHit[] = (proposals as Array<{
-      id: string;
-      title: string;
-      description?: string | null;
-   }>).map((p) => ({
+   const proposalHits: SearchHit[] = (
+      proposals as Array<{
+         id: string;
+         title: string;
+         description?: string | null;
+      }>
+   ).map(p => ({
       type: 'proposals' as const,
       id: p.id,
       name: p.title,

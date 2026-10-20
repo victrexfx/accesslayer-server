@@ -11,6 +11,7 @@ import {
    zodIssuesToDetails,
 } from '../../utils/api-response.utils';
 import { getTrending, getNewKeys, getGraduating } from './discovery.service';
+import { getSpotlight } from './keys-discovery.service';
 
 const router = Router();
 
@@ -92,6 +93,21 @@ router.get('/graduating', async (req, res, next) => {
    }
    try {
       sendSuccess(res, await getGraduating(parsed.data.limit));
+   } catch (error) {
+      next(error);
+   }
+});
+
+/**
+ * GET /discovery/spotlight
+ *
+ * Returns the currently spotlighted key details, end time, and winning bid.
+ * Computes time_remaining_seconds at request time.
+ * Returns null with no_spotlight flag when no active spotlight exists.
+ */
+router.get('/spotlight', async (_req, res, next) => {
+   try {
+      sendSuccess(res, await getSpotlight());
    } catch (error) {
       next(error);
    }
